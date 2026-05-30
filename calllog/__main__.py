@@ -14,8 +14,8 @@ from .web import address, make_server
 
 def main() -> int:
     cfg = Config.from_env()
-    db = Database(cfg.db_path)
-    httpd = make_server(db, cfg.host, cfg.port)
+    db = Database(cfg.db_path, cfg.recordings_dir)
+    httpd = make_server(db, cfg.host, cfg.port, cfg.api_key)
 
     stop = threading.Event()
 
@@ -29,7 +29,9 @@ def main() -> int:
     signal.signal(signal.SIGTERM, shutdown)
 
     host, port = address(httpd)
-    print(f"통화기록 통합관리 시스템: http://{host}:{port}  (DB={cfg.db_path})")
+    auth = "API키 인증 ON" if cfg.api_key else "API키 인증 OFF"
+    print(f"통화기록 통합관리 시스템: http://{host}:{port}  (DB={cfg.db_path}, "
+          f"녹음={cfg.recordings_dir}, 업로드 {auth})")
 
     try:
         httpd.serve_forever(poll_interval=0.5)

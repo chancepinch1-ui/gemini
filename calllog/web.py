@@ -1,16 +1,30 @@
-"""의존성 없는 웹 서버: 직원 입력 화면 + 관리자 통합조회 대시보드.
+"""의존성 없는 웹 서버: 직원 입력/녹음 업로드 + 관리자 통합조회·재생 대시보드.
 
-탭 하나로 직원이 통화기록을 입력하고, 다른 탭에서 관리자가 모든 직원의 기록을
-검색·필터·통계와 함께 조회/삭제할 수 있습니다.
+- 직원 입력 탭: 사람이 직접 통화기록 입력
+- 관리자 조회 탭: 모든 직원 기록을 검색·필터·통계와 함께 조회하고, 녹음을 재생/삭제
+- 업로드 API: 안드로이드 앱이 OS 기본 전화앱의 녹음 파일을 자동 업로드
 """
 
 import json
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Tuple
+from typing import Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from .db import Database
-from .models import CATEGORIES
+from .models import CATEGORIES, DIRECTIONS
+
+# 안드로이드 기본 전화앱 녹음 파일에서 흔한 오디오 포맷
+_AUDIO_MIME = {
+    ".m4a": "audio/mp4", ".mp4": "audio/mp4", ".aac": "audio/aac",
+    ".mp3": "audio/mpeg", ".amr": "audio/amr", ".3gp": "audio/3gpp",
+    ".wav": "audio/wav", ".ogg": "audio/ogg", ".opus": "audio/ogg",
+}
+
+
+def _mime_for(filename: str) -> str:
+    return _AUDIO_MIME.get(os.path.splitext(filename)[1].lower(), "application/octet-stream")
+
 
 _PAGE = """<!doctype html>
 <html lang="ko">
@@ -29,7 +43,7 @@ _PAGE = """<!doctype html>
   .tab { background: #20242e; color: #c7cdd8; border: 1px solid #2b3140; padding: 7px 16px;
          border-radius: 6px; cursor: pointer; font-size: 13px; }
   .tab.active { background: #3b82f6; color: #fff; border-color: #3b82f6; }
-  main { padding: 24px; max-width: 1100px; margin: 0 auto; }
+  main { padding: 24px; max-width: 1180px; margin: 0 auto; }
   .view { display: none; }
   .view.active { display: block; }
   .card { background: #161922; border: 1px solid #262b36; border-radius: 8px;
@@ -52,6 +66,7 @@ _PAGE = """<!doctype html>
   td, th { text-align: left; padding: 8px 10px; border-bottom: 1px solid #262b36;
            vertical-align: top; }
   th { color: #8a93a2; font-size: 12px; font-weight: 600; }
+  audio { height: 34px; width: 200px; }
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px,1fr));
            gap: 14px; }
   .stat { background: #0b0d12; border: 1px solid #2b3140; border-radius: 8px; padding: 14px; }
@@ -59,6 +74,7 @@ _PAGE = """<!doctype html>
   .stat .l { font-size: 12px; color: #8a93a2; }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px;
           background: #20242e; border: 1px solid #2b3140; color: #c7cdd8; }
+  .dir-수신 { color: #2ecc71; } .dir-발신 { color: #3b82f6; } .dir-부재중 { color: #e87979; }
   .filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; margin-bottom: 16px; }
   .filters > div { flex: 1; min-width: 150px; }
   .muted { color: #8a93a2; }
@@ -90,12 +106,13 @@ _PAGE = """<!doctype html>
           <div><label>고객명 *</label><input name="customer" required placeholder="김고객"></div>
           <div><label>전화번호 *</label><input name="phone" required placeholder="010-1234-5678"></div>
         </div>
-        <div class="row">
+        <div class="row3">
           <div><label>분류</label><select name="category" id="cat-select"></select></div>
+          <div><label>통화방향</label><select name="direction" id="dir-select"></select></div>
           <div><label>통화 일시</label><input type="datetime-local" name="called_at"></div>
         </div>
         <div style="margin-bottom:14px">
-          <label>통화내용 *</label>
+          <label>통화내용 / 메모 *</label>
           <textarea name="content" required placeholder="고객과 나눈 통화내용을 입력하세요"></textarea>
         </div>
         <button type="submit">기록 저장</button>
@@ -127,7 +144,7 @@ _PAGE = """<!doctype html>
       <table>
         <thead><tr>
           <th>통화일시</th><th>직원</th><th>고객명</th><th>전화번호</th>
-          <th>분류</th><th>통화내용</th><th></th>
+          <th>방향</th><th>시간</th><th>분류</th><th>통화내용</th><th>녹음</th><th></th>
         </tr></thead>
         <tbody id="log-rows"></tbody>
       </table>
@@ -137,12 +154,14 @@ _PAGE = """<!doctype html>
 
 </main>
 <script>
-let CATEGORIES = [];
+let CATEGORIES = [], DIRECTIONS = [];
 
 function esc(s){ return (s==null?'':String(s)).replace(/[&<>"]/g,
   c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function fmt(iso){ if(!iso) return '-'; const d=new Date(iso);
   return isNaN(d)? iso : d.toLocaleString('ko-KR',{dateStyle:'short',timeStyle:'short'}); }
+function dur(s){ s=+s||0; if(!s) return '-';
+  const m=Math.floor(s/60), x=s%60; return (m?m+'분 ':'')+x+'초'; }
 
 function show(v){
   document.querySelectorAll('.view').forEach(e=>e.classList.toggle('active', e.id===v));
@@ -152,9 +171,11 @@ function show(v){
 
 async function init(){
   const meta = await (await fetch('/api/meta')).json();
-  CATEGORIES = meta.categories;
+  CATEGORIES = meta.categories; DIRECTIONS = meta.directions;
   document.getElementById('cat-select').innerHTML =
     CATEGORIES.map(c=>`<option>${esc(c)}</option>`).join('');
+  document.getElementById('dir-select').innerHTML =
+    DIRECTIONS.map(c=>`<option>${esc(c)}</option>`).join('');
   document.getElementById('f-category').innerHTML =
     '<option value="">전체</option>' + CATEGORIES.map(c=>`<option>${esc(c)}</option>`).join('');
 }
@@ -165,10 +186,10 @@ async function submitLog(e){
   const r = await fetch('/api/logs', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(data)});
   const msg = document.getElementById('entry-msg');
-  if(r.ok){ msg.textContent='✓ 저장되었습니다'; f.reset();
+  if(r.ok){ msg.style.color='#2ecc71'; msg.textContent='✓ 저장되었습니다'; f.reset();
             setTimeout(()=>msg.textContent='', 2500); }
   else { const j = await r.json().catch(()=>({error:'오류'}));
-         msg.textContent='✗ ' + (j.error||'저장 실패'); msg.style.color='#e87979'; }
+         msg.style.color='#e87979'; msg.textContent='✗ ' + (j.error||'저장 실패'); }
   return false;
 }
 
@@ -178,6 +199,7 @@ async function refreshAdmin(){
   document.getElementById('stat-cards').innerHTML =
     `<div class="stat"><div class="n">${s.total}</div><div class="l">전체 통화건수</div></div>`
    +`<div class="stat"><div class="n">${s.today}</div><div class="l">오늘 통화건수</div></div>`
+   +`<div class="stat"><div class="n">${s.with_audio}</div><div class="l">녹음 보유</div></div>`
    +`<div class="stat"><div class="n">${meta.employees.length}</div><div class="l">등록 직원수</div></div>`;
   document.getElementById('emp-chips').innerHTML = s.by_employee.length
     ? s.by_employee.map(e=>`<span class="chip">${esc(e.employee)}<b>${e.count}</b></span>`).join('')
@@ -199,16 +221,22 @@ async function loadLogs(){
   if(q) p.set('q', q);
   const rows = await (await fetch('/api/logs?'+p)).json();
   document.getElementById('empty').style.display = rows.length ? 'none' : 'block';
-  document.getElementById('log-rows').innerHTML = rows.map(r =>
-    `<tr><td>${fmt(r.called_at)}</td><td>${esc(r.employee)}</td>`
-   +`<td>${esc(r.customer)}</td><td>${esc(r.phone)}</td>`
-   +`<td><span class="pill">${esc(r.category)}</span></td>`
-   +`<td style="white-space:pre-wrap;max-width:340px">${esc(r.content)}</td>`
-   +`<td><button class="danger" onclick="delLog(${r.id})">삭제</button></td></tr>`).join('');
+  document.getElementById('log-rows').innerHTML = rows.map(r => {
+    const audio = r.has_audio
+      ? `<audio controls preload="none" src="/api/recording/${r.id}"></audio>`
+      : '<span class="muted">-</span>';
+    return `<tr><td>${fmt(r.called_at)}</td><td>${esc(r.employee)}</td>`
+     +`<td>${esc(r.customer)}</td><td>${esc(r.phone)}</td>`
+     +`<td class="dir-${esc(r.direction)}">${esc(r.direction)}</td><td>${dur(r.duration_sec)}</td>`
+     +`<td><span class="pill">${esc(r.category)}</span></td>`
+     +`<td style="white-space:pre-wrap;max-width:300px">${esc(r.content)}</td>`
+     +`<td>${audio}</td>`
+     +`<td><button class="danger" onclick="delLog(${r.id})">삭제</button></td></tr>`;
+  }).join('');
 }
 
 async function delLog(id){
-  if(!confirm('이 통화기록을 삭제하시겠습니까?')) return;
+  if(!confirm('이 통화기록을 삭제하시겠습니까? (녹음 파일도 함께 삭제됩니다)')) return;
   await fetch('/api/logs/delete', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify({id})});
   refreshAdmin();
@@ -228,20 +256,23 @@ init();
 """
 
 
-def make_server(db: Database, host: str, port: int) -> ThreadingHTTPServer:
+def make_server(db: Database, host: str, port: int, api_key: str = "") -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args) -> None:
             pass
 
-        def _send(self, code: int, body: bytes, ctype: str) -> None:
+        def _send(self, code: int, body: bytes, ctype: str, extra=None) -> None:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
 
         def _json(self, code: int, obj) -> None:
-            self._send(code, json.dumps(obj, ensure_ascii=False).encode(), "application/json; charset=utf-8")
+            self._send(code, json.dumps(obj, ensure_ascii=False).encode(),
+                       "application/json; charset=utf-8")
 
         def _read_json(self) -> dict:
             length = int(self.headers.get("Content-Length", 0))
@@ -254,6 +285,9 @@ def make_server(db: Database, host: str, port: int) -> ThreadingHTTPServer:
             except (ValueError, UnicodeDecodeError):
                 return {}
 
+        def _authorized(self) -> bool:
+            return not api_key or self.headers.get("X-Api-Key", "") == api_key
+
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             path = parsed.path
@@ -262,6 +296,7 @@ def make_server(db: Database, host: str, port: int) -> ThreadingHTTPServer:
             elif path == "/api/meta":
                 self._json(200, {
                     "categories": list(CATEGORIES),
+                    "directions": list(DIRECTIONS),
                     "employees": db.employees(),
                     "stats": db.stats(),
                 })
@@ -273,44 +308,113 @@ def make_server(db: Database, host: str, port: int) -> ThreadingHTTPServer:
                     query=(qs.get("q", [None])[0] or None),
                 )
                 self._json(200, [lg.to_dict() for lg in logs])
+            elif path.startswith("/api/recording/"):
+                self._serve_recording(path.rsplit("/", 1)[-1])
             else:
                 self._send(404, b"not found", "text/plain")
+
+        def _serve_recording(self, raw_id: str) -> None:
+            try:
+                log = db.get(int(raw_id))
+            except ValueError:
+                log = None
+            if not log or not log.audio_filename:
+                self._send(404, b"recording not found", "text/plain")
+                return
+            fpath = db.recording_path(log.audio_filename)
+            if not fpath:
+                self._send(404, b"file missing", "text/plain")
+                return
+            with open(fpath, "rb") as f:
+                body = f.read()
+            ctype = log.audio_mime or _mime_for(log.audio_filename)
+            self._send(200, body, ctype, {"Content-Disposition": "inline"})
 
         def do_POST(self) -> None:
             path = urlparse(self.path).path
             if path == "/api/logs":
-                data = self._read_json()
-                required = ("employee", "customer", "phone", "content")
-                missing = [k for k in required if not str(data.get(k, "")).strip()]
-                if missing:
-                    self._json(400, {"error": f"필수 항목 누락: {', '.join(missing)}"})
-                    return
-                category = str(data.get("category") or "기타").strip()
-                if category not in CATEGORIES:
-                    category = "기타"
-                called_at = str(data.get("called_at") or "").strip() or None
-                new_id = db.add(
-                    employee=str(data["employee"]).strip(),
-                    customer=str(data["customer"]).strip(),
-                    phone=str(data["phone"]).strip(),
-                    content=str(data["content"]).strip(),
-                    category=category,
-                    called_at=called_at,
-                )
-                self._json(201, {"id": new_id})
+                self._create_log()
+            elif path == "/api/logs/upload":
+                self._upload_recording()
             elif path == "/api/logs/delete":
-                data = self._read_json()
-                try:
-                    log_id = int(data.get("id"))
-                except (TypeError, ValueError):
-                    self._json(400, {"error": "유효한 id가 필요합니다"})
-                    return
-                ok = db.delete(log_id)
-                self._json(200 if ok else 404, {"ok": ok})
+                self._delete_log()
             else:
                 self._send(404, b"not found", "text/plain")
 
+        def _create_log(self) -> None:
+            data = self._read_json()
+            required = ("employee", "customer", "phone", "content")
+            missing = [k for k in required if not str(data.get(k, "")).strip()]
+            if missing:
+                self._json(400, {"error": f"필수 항목 누락: {', '.join(missing)}"})
+                return
+            new_id = db.add(
+                employee=str(data["employee"]).strip(),
+                customer=str(data["customer"]).strip(),
+                phone=str(data["phone"]).strip(),
+                content=str(data["content"]).strip(),
+                category=_pick(data.get("category"), CATEGORIES, "기타"),
+                direction=_pick(data.get("direction"), DIRECTIONS, "기타"),
+                called_at=(str(data.get("called_at") or "").strip() or None),
+            )
+            self._json(201, {"id": new_id})
+
+        def _upload_recording(self) -> None:
+            """안드로이드 앱이 OS 녹음 파일 + 메타데이터를 업로드.
+
+            메타데이터는 쿼리스트링으로, 오디오는 요청 본문(raw bytes)으로 받습니다.
+            예) POST /api/logs/upload?employee=홍길동&phone=010...&duration_sec=42
+                X-Api-Key: <키>,  X-Audio-Filename: 20260530_103000_01012345678.m4a
+            """
+            if not self._authorized():
+                self._json(401, {"error": "인증 실패 (X-Api-Key)"})
+                return
+            qs = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+            employee = (qs.get("employee") or "").strip()
+            if not employee:
+                self._json(400, {"error": "필수 항목 누락: employee"})
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            audio = self.rfile.read(length) if length else b""
+            audio_filename = audio_mime = ""
+            if audio:
+                original = self.headers.get("X-Audio-Filename", "recording.m4a")
+                audio_filename = db.save_recording(audio, original)
+                audio_mime = _mime_for(original)
+            try:
+                duration = int(qs.get("duration_sec") or 0)
+            except ValueError:
+                duration = 0
+            new_id = db.add(
+                employee=employee,
+                customer=(qs.get("customer") or "").strip(),
+                phone=(qs.get("phone") or "").strip(),
+                content=(qs.get("content") or "").strip(),
+                category=_pick(qs.get("category"), CATEGORIES, "기타"),
+                direction=_pick(qs.get("direction"), DIRECTIONS, "기타"),
+                duration_sec=duration,
+                audio_filename=audio_filename,
+                audio_mime=audio_mime,
+                called_at=((qs.get("called_at") or "").strip() or None),
+            )
+            self._json(201, {"id": new_id, "audio_filename": audio_filename})
+
+        def _delete_log(self) -> None:
+            data = self._read_json()
+            try:
+                log_id = int(data.get("id"))
+            except (TypeError, ValueError):
+                self._json(400, {"error": "유효한 id가 필요합니다"})
+                return
+            ok = db.delete(log_id)
+            self._json(200 if ok else 404, {"ok": ok})
+
     return ThreadingHTTPServer((host, port), Handler)
+
+
+def _pick(value: Optional[str], allowed: Tuple[str, ...], default: str) -> str:
+    v = str(value or "").strip()
+    return v if v in allowed else default
 
 
 def address(httpd: ThreadingHTTPServer) -> Tuple[str, int]:

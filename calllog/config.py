@@ -12,6 +12,8 @@ class Config:
     host: str
     port: int
     db_path: str
+    recordings_dir: str
+    api_key: str  # 비어 있으면 업로드 인증을 요구하지 않음
 
     @staticmethod
     def from_env() -> "Config":
@@ -19,4 +21,6 @@ class Config:
             host=os.environ.get("CALLLOG_HOST", "127.0.0.1"),
             port=int(os.environ.get("CALLLOG_PORT", "8770")),
             db_path=os.environ.get("CALLLOG_DB", "calllog.db"),
+            recordings_dir=os.environ.get("CALLLOG_RECORDINGS", "recordings"),
+            api_key=os.environ.get("CALLLOG_API_KEY", ""),
         )
